@@ -46,6 +46,10 @@ source /etc/os-release
 log INFO "OS: ${PRETTY_NAME}"
 log INFO "Kernel before upgrade: $(uname -r)"
 
+log INFO "Repairing interrupted dpkg state, if any."
+DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+log OK "dpkg state is consistent."
+
 log INFO "Running apt-get update."
 apt-get update
 log OK "apt-get update completed."

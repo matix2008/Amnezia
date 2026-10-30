@@ -1096,6 +1096,30 @@ chmod +x /root/upgrade.sh
             return $true
         }
 
+        if ($result.Code -eq 255) {
+            # ssh.exe itself failed or the connection dropped mid-upgrade.
+            # upgrade.sh is idempotent and repairs an interrupted dpkg state,
+            # so wait for SSH and run it again.
+            Write-Log -Level 'WARN' -Message "SSH connection lost during upgrade on $IP; waiting for SSH to retry."
+
+            $restored = $false
+            for ($i = 0; $i -lt 30; $i++) {
+                if (Test-Ssh -IP $IP -Quiet) {
+                    $restored = $true
+                    break
+                }
+
+                Start-Sleep -Seconds 10
+            }
+
+            if (-not $restored) {
+                throw "SSH did not return after connection loss during upgrade on $IP"
+            }
+
+            Write-Log -Level 'OK' -Message "SSH restored on $IP; retrying upgrade."
+            continue
+        }
+
         if ($result.Code -ne 10) {
             throw "upgrade.sh failed with code $($result.Code) on $IP"
         }
@@ -1360,8 +1384,24 @@ if [[ "$SERVICE_CHANGED" == "1" ]]; then
     systemctl restart awg-iptables.service
 fi
 
-systemctl is-active --quiet awg-quick@awg0.service
-systemctl is-active --quiet awg-iptables.service
+# Restarting awg-quick@awg0 cascades a restart to awg-iptables.service
+# (Requires=), which finishes asynchronously; wait for it instead of
+# checking immediately.
+wait_active()
+{
+    local unit="$1"
+    local i
+
+    for i in $(seq 1 30); do
+        systemctl is-active --quiet "$unit" && return 0
+        sleep 0.5
+    done
+
+    return 1
+}
+
+wait_active awg-quick@awg0.service
+wait_active awg-iptables.service
 
 if [[ "$CONF_CHANGED" == "1" && "$PORT_CHANGED" == "1" && "$UFW_ACTIVE" == "1" && -n "$OLD_PORT" ]]; then
     if ufw status | grep -Eq '(^|[[:space:]])'"${OLD_PORT}"'/udp([[:space:]]|$)'; then
