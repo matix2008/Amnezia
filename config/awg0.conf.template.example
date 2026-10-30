@@ -1,0 +1,22 @@
+[Interface]
+Address = {{WG_IPV4_SERVER}}/24, {{WG_IPV6_SERVER}}/64
+ListenPort = {{AWG_PORT}}
+PrivateKey = {{SERVER_PRIVATE_KEY}}
+
+Jc = {{JC}}
+Jmin = {{JMIN}}
+Jmax = {{JMAX}}
+
+S1 = {{S1}}
+S2 = {{S2}}
+S3 = {{S3}}
+S4 = {{S4}}
+
+H1 = {{H1}}
+H2 = {{H2}}
+H3 = {{H3}}
+H4 = {{H4}}
+
+RandomTrailers = {{RANDOM_TRAILERS}}
+
+# PEERS

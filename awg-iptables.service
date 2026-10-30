@@ -1,0 +1,28 @@
+[Unit]
+Description=AmneziaWG NAT and forwarding
+After=network-online.target awg-quick@awg0.service
+Wants=network-online.target
+Requires=awg-quick@awg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+ExecStart=/bin/sh -c '/usr/sbin/iptables -w 5 -t nat -C POSTROUTING -s {{WG_IPV4_NETWORK}} ! -d {{WG_IPV4_NETWORK}} -j MASQUERADE 2>/dev/null || /usr/sbin/iptables -w 5 -t nat -A POSTROUTING -s {{WG_IPV4_NETWORK}} ! -d {{WG_IPV4_NETWORK}} -j MASQUERADE'
+ExecStart=/bin/sh -c '/usr/sbin/iptables -w 5 -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || /usr/sbin/iptables -w 5 -I FORWARD 1 -i awg0 -j ACCEPT'
+ExecStart=/bin/sh -c '/usr/sbin/iptables -w 5 -C FORWARD -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || /usr/sbin/iptables -w 5 -I FORWARD 1 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT'
+
+ExecStart=/bin/sh -c '/usr/sbin/ip6tables -w 5 -t nat -C POSTROUTING -s {{WG_IPV6_NETWORK}} ! -d {{WG_IPV6_NETWORK}} -j MASQUERADE 2>/dev/null || /usr/sbin/ip6tables -w 5 -t nat -A POSTROUTING -s {{WG_IPV6_NETWORK}} ! -d {{WG_IPV6_NETWORK}} -j MASQUERADE'
+ExecStart=/bin/sh -c '/usr/sbin/ip6tables -w 5 -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || /usr/sbin/ip6tables -w 5 -I FORWARD 1 -i awg0 -j ACCEPT'
+ExecStart=/bin/sh -c '/usr/sbin/ip6tables -w 5 -C FORWARD -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || /usr/sbin/ip6tables -w 5 -I FORWARD 1 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT'
+
+ExecStop=-/bin/sh -c '/usr/sbin/iptables -w 5 -t nat -C POSTROUTING -s {{WG_IPV4_NETWORK}} ! -d {{WG_IPV4_NETWORK}} -j MASQUERADE 2>/dev/null && /usr/sbin/iptables -w 5 -t nat -D POSTROUTING -s {{WG_IPV4_NETWORK}} ! -d {{WG_IPV4_NETWORK}} -j MASQUERADE || true'
+ExecStop=-/bin/sh -c '/usr/sbin/iptables -w 5 -C FORWARD -i awg0 -j ACCEPT 2>/dev/null && /usr/sbin/iptables -w 5 -D FORWARD -i awg0 -j ACCEPT || true'
+ExecStop=-/bin/sh -c '/usr/sbin/iptables -w 5 -C FORWARD -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null && /usr/sbin/iptables -w 5 -D FORWARD -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true'
+
+ExecStop=-/bin/sh -c '/usr/sbin/ip6tables -w 5 -t nat -C POSTROUTING -s {{WG_IPV6_NETWORK}} ! -d {{WG_IPV6_NETWORK}} -j MASQUERADE 2>/dev/null && /usr/sbin/ip6tables -w 5 -t nat -D POSTROUTING -s {{WG_IPV6_NETWORK}} ! -d {{WG_IPV6_NETWORK}} -j MASQUERADE || true'
+ExecStop=-/bin/sh -c '/usr/sbin/ip6tables -w 5 -C FORWARD -i awg0 -j ACCEPT 2>/dev/null && /usr/sbin/ip6tables -w 5 -D FORWARD -i awg0 -j ACCEPT || true'
+ExecStop=-/bin/sh -c '/usr/sbin/ip6tables -w 5 -C FORWARD -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null && /usr/sbin/ip6tables -w 5 -D FORWARD -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true'
+
+[Install]
+WantedBy=multi-user.target
