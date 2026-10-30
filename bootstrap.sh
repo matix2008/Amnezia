@@ -90,6 +90,11 @@ log OK "ListenPort verified: $AWG_PORT"
 
 log INFO "Installing AmneziaWG."
 
+# Wait for a concurrent apt/dpkg run instead of failing on its lock.
+cat >/etc/apt/apt.conf.d/00-amnezia-lock-timeout <<'APT_LOCK_EOF'
+DPkg::Lock::Timeout "300";
+APT_LOCK_EOF
+
 if ! apt-cache policy amneziawg 2>/dev/null |
      grep -Eq 'Candidate:[[:space:]]+[^ (]'; then
 

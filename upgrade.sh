@@ -46,6 +46,20 @@ source /etc/os-release
 log INFO "OS: ${PRETTY_NAME}"
 log INFO "Kernel before upgrade: $(uname -r)"
 
+log INFO "Setting apt/dpkg lock timeout."
+cat >/etc/apt/apt.conf.d/00-amnezia-lock-timeout <<'APT_LOCK_EOF'
+DPkg::Lock::Timeout "300";
+APT_LOCK_EOF
+
+# dpkg itself has no lock timeout: wait for a previous apt/dpkg run
+# (for example one left over after a dropped SSH session) to finish.
+for _ in $(seq 1 60); do
+    fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1 || break
+    sleep 5
+done
+fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1 && \
+    die "dpkg lock is still held after 300s"
+
 log INFO "Repairing interrupted dpkg state, if any."
 DEBIAN_FRONTEND=noninteractive dpkg --configure -a
 log OK "dpkg state is consistent."
