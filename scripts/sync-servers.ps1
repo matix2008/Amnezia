@@ -1,6 +1,9 @@
 ﻿param(
     [Parameter(Mandatory = $false, Position = 0)]
-    [string]$ServerName
+    [string]$ServerName,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Check
 )
 
 $ErrorActionPreference = 'Stop'
@@ -427,7 +430,10 @@ function Set-SingleConfigValue {
 function Sync-LocalClientConfigs {
     param(
         [Parameter(Mandatory = $true)]
-        [hashtable]$Env
+        [hashtable]$Env,
+
+        # Report differences without rewriting profiles or deleting derived ones.
+        [switch]$CheckOnly
     )
 
     if (-not (Test-Path $ClientsDir)) {
@@ -480,6 +486,13 @@ function Sync-LocalClientConfigs {
         }
 
         if ($updated -ne $original) {
+            if ($CheckOnly) {
+                Write-Log -Level 'WARN' -Message "Local client config differs from server.env and would be updated: $($file.Name)"
+                $script:LocalConfigDrift = $true
+                $updatedCount++
+                continue
+            }
+
             Write-Utf8Lf `
                 -Path $file.FullName `
                 -Text $updated
@@ -491,6 +504,9 @@ function Sync-LocalClientConfigs {
 
     if ($updatedCount -eq 0) {
         Write-Log -Level 'OK' -Message "Local client configs already match server.env ($($clientFiles.Count) checked)."
+    }
+    elseif ($CheckOnly) {
+        Write-Log -Level 'WARN' -Message "$updatedCount of $($clientFiles.Count) local client config(s) differ from server.env. A normal run updates them and removes derived profiles (check only: nothing changed)."
     }
     else {
         Write-Log -Level 'OK' -Message "Local client config synchronization complete: $updatedCount updated, $($clientFiles.Count) checked."
@@ -1362,6 +1378,62 @@ fi
     return $status
 }
 
+# Read-only variant for -Check: nothing is uploaded; the VPS files are hashed
+# on the server and compared with hashes of the local candidates.
+function Get-SyncStatusByHash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$IP,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FirewallPath
+    )
+
+    $configHash = (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $firewallHash = (Get-FileHash -LiteralPath $FirewallPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    $command = @'
+compare()
+{
+    local label="$1" file="$2" expected="$3"
+
+    if [[ ! -f "$file" ]]; then
+        echo "${label}=MISSING"
+    elif [[ "$(sha256sum "$file" | cut -d' ' -f1)" == "$expected" ]]; then
+        echo "${label}=SAME"
+    else
+        echo "${label}=DIFF"
+    fi
+}
+
+compare CONFIG /etc/amnezia/amneziawg/awg0.conf __CONFIG_HASH__
+compare FIREWALL /etc/systemd/system/awg-iptables.service __FIREWALL_HASH__
+'@
+
+    $command = $command.Replace('__CONFIG_HASH__', $configHash).Replace('__FIREWALL_HASH__', $firewallHash)
+
+    $result = Invoke-Remote `
+        -IP $IP `
+        -Command $command
+
+    $status = @{}
+
+    foreach ($line in ($result.Output -split "`n")) {
+        if ($line -match '^([A-Z]+)=(.+)$') {
+            $status[$matches[1]] = $matches[2].Trim()
+        }
+    }
+
+    if (-not $status.ContainsKey('CONFIG') -or -not $status.ContainsKey('FIREWALL')) {
+        throw "Unable to parse remote synchronization status from $IP"
+    }
+
+    return $status
+}
+
 # ============================================================
 # Apply sync
 # ============================================================
@@ -1677,7 +1749,13 @@ Write-Log -Level 'INFO' -Message "Selected targets: $($Targets.Name -join ', ')"
 
 # Prepare existing local client configs once per run.
 # An empty peer list is valid for READY/DEGRADED servers and when the last client was removed.
-Sync-LocalClientConfigs -Env $Env
+$script:LocalConfigDrift = $false
+
+if ($Check) {
+    Write-Log -Level 'INFO' -Message 'CHECK mode: nothing is changed locally or on the VPS, no confirmations are asked.'
+}
+
+Sync-LocalClientConfigs -Env $Env -CheckOnly:$Check
 Test-ClientEndpoints -Servers $Servers
 
 $Results = @()
@@ -1709,6 +1787,68 @@ foreach ($Server in $Targets) {
             Out-Null
 
         Write-Log -Level 'INFO' -Message "Temporary directory created for $($Server.Name): $temp"
+
+        # ----------------------------------------------------
+        # CHECK mode: read-only comparison, then next server.
+        # ----------------------------------------------------
+
+        if ($Check) {
+
+            $checkState = Get-ServerBootstrapState -IP $Server.IP
+            Write-Log -Level 'INFO' -Message "Check: $($Server.Name) state=$checkState"
+
+            if ($checkState -eq 'NEW') {
+                $ServerStatus = 'CHANGES'
+                $ServerMessage = 'New VPS: upgrade and bootstrap are required.'
+                continue
+            }
+
+            $checkConfig = New-CandidateConfig `
+                -Server $Server `
+                -Env $Env `
+                -TempDirectory $temp
+
+            $checkFirewall = New-CandidateFirewall `
+                -Server $Server `
+                -Env $Env `
+                -TempDirectory $temp
+
+            $checkStatus = Get-SyncStatusByHash `
+                -IP $Server.IP `
+                -ConfigPath $checkConfig `
+                -FirewallPath $checkFirewall
+
+            Write-Log -Level 'INFO' -Message "Comparison result for $($Server.Name): AWG=$($checkStatus['CONFIG']); iptables-service=$($checkStatus['FIREWALL'])"
+
+            $checkProblems = @()
+
+            if ($checkState -eq 'DEGRADED') {
+                $checkProblems += 'AmneziaWG is degraded (repair bootstrap required)'
+            }
+
+            if ($checkStatus['CONFIG'] -ne 'SAME') {
+                $checkProblems += "awg0.conf: $($checkStatus['CONFIG'])"
+            }
+
+            if ($checkStatus['FIREWALL'] -ne 'SAME') {
+                $checkProblems += "awg-iptables.service: $($checkStatus['FIREWALL'])"
+            }
+
+            if (-not (Test-Secured -IP $Server.IP -Port ([string]$Server.Port))) {
+                $checkProblems += 'security hardening is incomplete'
+            }
+
+            if ($checkProblems.Count -eq 0) {
+                $ServerStatus = 'OK'
+                $ServerMessage = 'Configuration and security state are current (check only).'
+            }
+            else {
+                $ServerStatus = 'CHANGES'
+                $ServerMessage = "Changes required: $($checkProblems -join '; ')."
+            }
+
+            continue
+        }
 
         # ----------------------------------------------------
         # Always prepare and copy current Linux artifacts.
@@ -1965,13 +2105,16 @@ foreach ($Server in $Targets) {
     }
     finally {
 
-        try {
-            if (Test-Ssh -IP $Server.IP -Quiet) {
-                Clear-RemoteStaging -IP $Server.IP
+        # CHECK mode never writes to the VPS, so there is nothing to clear.
+        if (-not $Check) {
+            try {
+                if (Test-Ssh -IP $Server.IP -Quiet) {
+                    Clear-RemoteStaging -IP $Server.IP
+                }
             }
-        }
-        catch {
-            Write-Log -Level 'WARN' -Message "Unable to clear remote staging files on $($Server.IP)."
+            catch {
+                Write-Log -Level 'WARN' -Message "Unable to clear remote staging files on $($Server.IP)."
+            }
         }
 
         if ($temp -and (Test-Path $temp)) {
@@ -2035,6 +2178,18 @@ $Failed = @(
 if ($Failed.Count -gt 0) {
     Write-Log -Level 'DONE' -Message "Completed with errors: $($Failed.Count) server(s) failed. Log: $LogFile"
     exit 1
+}
+
+if ($Check) {
+    $NeedChanges = @($Results | Where-Object { $_.Status -eq 'CHANGES' })
+
+    if ($NeedChanges.Count -gt 0 -or $script:LocalConfigDrift) {
+        Write-Log -Level 'DONE' -Message "Check completed: $($NeedChanges.Count) server(s) need changes; local client configs differ from server.env: $($script:LocalConfigDrift). Nothing was changed. Log: $LogFile"
+        exit 2
+    }
+
+    Write-Log -Level 'DONE' -Message "Check completed: all selected servers and local configs are current. Nothing was changed. Log: $LogFile"
+    exit 0
 }
 
 $Pending = @(
