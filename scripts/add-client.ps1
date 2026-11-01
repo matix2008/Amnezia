@@ -2,7 +2,7 @@
     [Parameter(Mandatory = $false, Position = 0)]
     [string]$ClientName,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $false, Position = 1)]
     [string]$ServerName
 )
 
