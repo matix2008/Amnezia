@@ -141,6 +141,19 @@ sysctl --system >/dev/null
 [[ "$(sysctl -n net.ipv6.conf.all.forwarding)" == "1" ]] || die "IPv6 forwarding is not enabled"
 log OK "IPv4/IPv6 forwarding enabled and verified."
 
+# Some provider images ship with UFW already active and the AWG UDP port closed,
+# so the VPN could not be verified before hardening. Disable it only while the
+# server is not hardened yet; secure.sh enables UFW again with the SSH and AWG
+# rules. A hardened server (repair run) keeps its firewall untouched.
+HARDENING_DROPIN="/etc/ssh/sshd_config.d/00-amnezia-hardening.conf"
+
+if [[ ! -f "$HARDENING_DROPIN" ]] &&
+   command -v ufw >/dev/null 2>&1 &&
+   [[ "$(ufw status 2>/dev/null | head -n1)" == "Status: active" ]]; then
+    log WARN "UFW is active before hardening; disabling it so the VPN can be verified. secure.sh enables it again."
+    ufw --force disable
+fi
+
 log INFO "Installing AmneziaWG configuration and NAT/FORWARD service."
 install -d -o root -g root -m 700 "$DST_DIR"
 
