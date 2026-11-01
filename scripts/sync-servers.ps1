@@ -2039,11 +2039,11 @@ foreach ($Server in $Targets) {
 
                 Invoke-Sync -IP $Server.IP
 
-                $check = Get-SyncStatus -IP $Server.IP
+                $postSyncStatus = Get-SyncStatus -IP $Server.IP
 
                 if (
-                    $check['CONFIG'] -ne 'SAME' -or
-                    $check['FIREWALL'] -ne 'SAME'
+                    $postSyncStatus['CONFIG'] -ne 'SAME' -or
+                    $postSyncStatus['FIREWALL'] -ne 'SAME'
                 ) {
                     throw "Post-sync verification failed: $($Server.Name)"
                 }
