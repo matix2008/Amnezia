@@ -1,6 +1,12 @@
 ﻿param(
     [Parameter(Mandatory = $false)]
-    [switch]$Force
+    [switch]$Force,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$NoBackup,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Restore
 )
 
 $ErrorActionPreference = 'Stop'
@@ -101,7 +107,7 @@ trap {
     exit 1
 }
 
-Write-Log -Level 'START' -Message 'Generating complete server.env.'
+Write-Log -Level 'START' -Message $(if ($Restore) { 'Restoring server.env from backup.' } else { 'Generating complete server.env.' })
 Write-Log -Level 'INFO' -Message "PowerShell version: $($PSVersionTable.PSVersion)"
 
 # ============================================================
@@ -305,6 +311,134 @@ function New-AwgHeaderValues {
 }
 
 # ============================================================
+# server.env backups
+# ============================================================
+
+$RequiredEnvKeys = @(
+    'WG_IPV4_NETWORK',
+    'WG_IPV4_SERVER',
+    'WG_IPV6_NETWORK',
+    'WG_IPV6_SERVER',
+    'DNS1',
+    'DNS2',
+    'SERVER_PRIVATE_KEY',
+    'SERVER_PUBLIC_KEY',
+    'JC',
+    'JMIN',
+    'JMAX',
+    'S1',
+    'S2',
+    'S3',
+    'S4',
+    'H1',
+    'H2',
+    'H3',
+    'H4',
+    'RANDOM_TRAILERS'
+)
+
+$BackupKeepCount = 3
+
+function Get-EnvBackups {
+    # The timestamp in the name sorts chronologically; newest first.
+    $dir = Split-Path -Parent $EnvFile
+
+    if (-not (Test-Path -LiteralPath $dir)) {
+        return @()
+    }
+
+    return @(
+        Get-ChildItem -LiteralPath $dir -Filter 'server.env.*.bak' -File |
+        Sort-Object Name -Descending
+    )
+}
+
+function New-EnvBackup {
+    $path = Join-Path (Split-Path -Parent $EnvFile) (
+        'server.env.' + (Get-Date -Format 'yyyyMMdd-HHmmssfff') + '.bak'
+    )
+
+    Copy-Item -LiteralPath $EnvFile -Destination $path
+
+    Write-Log -Level 'OK' -Message "Backup of the current server.env created: $path"
+
+    @(Get-EnvBackups | Select-Object -Skip $BackupKeepCount) | ForEach-Object {
+        Remove-Item -LiteralPath $_.FullName -Force
+        Write-Log -Level 'INFO' -Message "Old backup removed (keeping the last $BackupKeepCount): $($_.Name)"
+    }
+
+    return $path
+}
+
+function Test-EnvText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text
+    )
+
+    foreach ($required in $RequiredEnvKeys) {
+        if ($Text -notmatch "(?m)^$([regex]::Escape($required))=\S") {
+            return "missing parameter: $required"
+        }
+    }
+
+    foreach ($keyName in @('SERVER_PRIVATE_KEY', 'SERVER_PUBLIC_KEY')) {
+        if ($Text -notmatch "(?m)^$keyName=[A-Za-z0-9+/]{43}=\s*$") {
+            return "$keyName has an unexpected format"
+        }
+    }
+
+    return $null
+}
+
+# ============================================================
+# Restore mode
+# ============================================================
+
+if ($Restore) {
+    $backups = @(Get-EnvBackups)
+
+    if ($backups.Count -eq 0) {
+        throw "No server.env backups found in $(Split-Path -Parent $EnvFile)"
+    }
+
+    $source = $backups[0]
+    $problem = Test-EnvText -Text (Get-Content -LiteralPath $source.FullName -Raw)
+
+    if ($problem) {
+        throw "Backup $($source.Name) is not a valid server.env: $problem"
+    }
+
+    Write-Log -Level 'WARN' -Message "server.env will be restored from the newest backup: $($source.Name)"
+
+    if (-not $NoBackup -and (Test-Path -LiteralPath $EnvFile)) {
+        Write-Log -Level 'INFO' -Message 'The current server.env will be saved as a new backup first (a second -Restore undoes this one).'
+    }
+    elseif (Test-Path -LiteralPath $EnvFile) {
+        Write-Log -Level 'WARN' -Message 'No backup of the current server.env will be created because -NoBackup was specified.'
+    }
+
+    if (-not $Force) {
+        if (-not (Confirm-Action 'Replace the current server.env with the backup?')) {
+            Write-Log -Level 'DONE' -Message 'CANCELLED.'
+            exit 0
+        }
+    }
+
+    if (-not $NoBackup -and (Test-Path -LiteralPath $EnvFile)) {
+        [void](New-EnvBackup)
+    }
+
+    Copy-Item -LiteralPath $source.FullName -Destination $EnvFile -Force
+
+    Write-Log -Level 'OK' -Message "server.env restored from $($source.Name)"
+    Write-Log -Level 'WARN' -Message 'VPS servers and client configs still use the previous keys until sync-servers.ps1 is applied.'
+    Write-Log -Level 'WARN' -Message 'Derived client profiles must be recreated with make-client-config.ps1 after sync-servers.ps1.'
+    Write-Log -Level 'DONE' -Message "SUCCESS. Log: $LogFile"
+    exit 0
+}
+
+# ============================================================
 # Fixed baseline for this infrastructure
 # ============================================================
 
@@ -335,10 +469,16 @@ $RANDOM_TRAILERS = 'on'
 
 if (Test-Path -LiteralPath $EnvFile) {
     Write-Log -Level 'WARN' -Message "Existing server.env will be replaced: $EnvFile"
-    Write-Log -Level 'WARN' -Message 'No backup will be created, so the old private key is not retained.'
+
+    if ($NoBackup) {
+        Write-Log -Level 'WARN' -Message 'No backup will be created (-NoBackup), so the old private key is not retained.'
+    }
+    else {
+        Write-Log -Level 'WARN' -Message "The current server.env will be saved as config\server.env.<time>.bak (unencrypted; the last $BackupKeepCount copies are kept). Use -NoBackup if the old private key is compromised."
+    }
 
     if (-not $Force) {
-        if (-not (Confirm-Action 'Generate a new server.env and permanently replace the existing one?')) {
+        if (-not (Confirm-Action 'Generate a new server.env and replace the existing one?')) {
             Write-Log -Level 'DONE' -Message 'CANCELLED.'
             exit 0
         }
@@ -438,31 +578,15 @@ try {
 
     $check = Get-Content -LiteralPath $TempFile -Raw
 
-    foreach ($required in @(
-        'WG_IPV4_NETWORK=',
-        'WG_IPV4_SERVER=',
-        'WG_IPV6_NETWORK=',
-        'WG_IPV6_SERVER=',
-        'DNS1=',
-        'DNS2=',
-        'SERVER_PRIVATE_KEY=',
-        'SERVER_PUBLIC_KEY=',
-        'JC=',
-        'JMIN=',
-        'JMAX=',
-        'S1=',
-        'S2=',
-        'S3=',
-        'S4=',
-        'H1=',
-        'H2=',
-        'H3=',
-        'H4=',
-        'RANDOM_TRAILERS='
-    )) {
-        if ($check -notmatch "(?m)^$([regex]::Escape($required))") {
-            throw "Generated server.env is missing parameter: $required"
-        }
+    $problem = Test-EnvText -Text $check
+
+    if ($problem) {
+        throw "Generated server.env is invalid: $problem"
+    }
+
+    # Back up only after a successful generation, right before the replacement.
+    if ((Test-Path -LiteralPath $EnvFile) -and -not $NoBackup) {
+        $BackupPath = New-EnvBackup
     }
 
     Copy-Item -LiteralPath $TempFile -Destination $EnvFile -Force
@@ -481,6 +605,13 @@ Write-Log -Level 'INFO' -Message "IPv6 network: $WG_IPV6_NETWORK; server: $WG_IP
 Write-Log -Level 'INFO' -Message "DNS: $DNS1, $DNS2"
 Write-Log -Level 'INFO' -Message "AWG: JC=$JC JMIN=$JMIN JMAX=$JMAX S1-S4=$S1 RandomTrailers=$RANDOM_TRAILERS"
 Write-Log -Level 'INFO' -Message 'H1-H4 generated; values are not written to the log.'
+
+$ExistingBackups = @(Get-EnvBackups)
+
+if ($NoBackup -and $ExistingBackups.Count -gt 0) {
+    Write-Log -Level 'WARN' -Message "$($ExistingBackups.Count) earlier server.env backup(s) remain in $ConfigDir and may contain the old private key; delete them if it is compromised."
+}
+
 Write-Log -Level 'WARN' -Message 'All existing client configs now reference the old SERVER_PUBLIC_KEY until sync-servers.ps1 updates them.'
 Write-Log -Level 'WARN' -Message 'All configured VPS servers continue using the old SERVER_PRIVATE_KEY until sync-servers.ps1 is applied.'
 Write-Log -Level 'DONE' -Message "SUCCESS. Log: $LogFile"
