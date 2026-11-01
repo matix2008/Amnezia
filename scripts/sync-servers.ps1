@@ -515,6 +515,90 @@ function Sync-LocalClientConfigs {
     }
 }
 
+function Test-ClientEndpoints {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Servers
+    )
+
+    # Sync never rewrites Endpoint, so after an IP/port change of a VPS the
+    # profiles keep the old address. Only warn; reissuing profiles is a manual step.
+    $profiles = @()
+
+    if (Test-Path -LiteralPath $ClientsDir) {
+        $profiles += @(
+            Get-ChildItem -LiteralPath $ClientsDir -Filter '*.conf' -File -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                [PSCustomObject]@{ Path = $_.FullName; Label = $_.Name; Server = $null }
+            }
+        )
+
+        $generatedDir = Join-Path $ClientsDir 'generated'
+
+        if (Test-Path -LiteralPath $generatedDir) {
+            $profiles += @(
+                Get-ChildItem -LiteralPath $generatedDir -Filter '*.conf' -File -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    [PSCustomObject]@{
+                        Path   = $_.FullName
+                        Label  = "generated\$($_.Directory.Name)\$($_.Name)"
+                        Server = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+                    }
+                }
+            )
+        }
+    }
+
+    $problems = 0
+
+    foreach ($item in $profiles) {
+        $match = [regex]::Match(
+            (Get-Content -LiteralPath $item.Path -Raw),
+            '(?m)^\s*Endpoint\s*=\s*(\S+)\s*$'
+        )
+
+        if (-not $match.Success) {
+            continue
+        }
+
+        $endpoint = $match.Groups[1].Value
+        $matchesAny = @($Servers | Where-Object { "$($_.IP):$($_.Port)" -eq $endpoint })
+
+        if ($item.Server) {
+            # A derived profile must point exactly to its own server.
+            $own = @($Servers | Where-Object { $_.Name -eq $item.Server })
+
+            if ($own.Count -eq 0) {
+                Write-Log -Level 'WARN' -Message "Derived profile $($item.Label) belongs to server '$($item.Server)', which is not in servers.txt; remove it."
+                $problems++
+            }
+            elseif ("$($own[0].IP):$($own[0].Port)" -ne $endpoint) {
+                Write-Log -Level 'WARN' -Message "Derived profile $($item.Label) has Endpoint $endpoint, but servers.txt has $($own[0].IP):$($own[0].Port); recreate it with make-client-config.ps1."
+                $problems++
+            }
+
+            continue
+        }
+
+        if ($matchesAny.Count -eq 0) {
+            Write-Log -Level 'WARN' -Message "Client profile $($item.Label) has Endpoint $endpoint, which matches no server in servers.txt; the profile will not connect. Edit Endpoint or issue a new profile with make-client-config.ps1."
+            $problems++
+            continue
+        }
+
+        $enabled = @($matchesAny | Where-Object { ([string]$_.Enabled).Trim().ToLowerInvariant() -eq 'true' })
+
+        if ($enabled.Count -eq 0) {
+            Write-Log -Level 'WARN' -Message "Client profile $($item.Label) points to disabled server '$($matchesAny[0].Name)' ($endpoint)."
+            $problems++
+        }
+    }
+
+    if ($problems -eq 0 -and $profiles.Count -gt 0) {
+        Write-Log -Level 'OK' -Message "Client profile endpoints match servers.txt ($($profiles.Count) checked)."
+    }
+}
+
 function Convert-Template {
     param(
         [Parameter(Mandatory = $true)]
@@ -1594,6 +1678,7 @@ Write-Log -Level 'INFO' -Message "Selected targets: $($Targets.Name -join ', ')"
 # Prepare existing local client configs once per run.
 # An empty peer list is valid for READY/DEGRADED servers and when the last client was removed.
 Sync-LocalClientConfigs -Env $Env
+Test-ClientEndpoints -Servers $Servers
 
 $Results = @()
 
