@@ -2,6 +2,8 @@
 config/server.env
 config/awg0.conf.template
 clients/
+# Секреты и конфигурации ручного прототипа SEG (этап 0)
+proto/
 
 # Список серверов (IP и порты); пример: servers.txt.example
 servers.txt
