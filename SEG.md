@@ -297,6 +297,14 @@ destination ∉ seg-list
 - содержит `route.auto_detect_interface`, чтобы соединение с VPS2 не попадало в собственный TUN;
 - не перехватывает управляющий трафик (SSH к VPS): адреса VPS отсутствуют в `seg-list` и идут DIRECT.
 
+Windows-клиент (проверено прототипом):
+
+- TUN-адаптер с `auto_route` и `strict_route`. `strict_route` блокирует порт 53 на всех интерфейсах, кроме TUN, в том числе для самого `sing-box`: прямой DNS нельзя задавать как UDP/TCP 53, запросы зависают без ошибки в журнале. Для прямого DNS используется DoH/DoT;
+- `seg-list` задаётся один раз как inline `rule_set` и используется и в DNS-правилах, и в маршрутизации;
+- порядок правил маршрутизации: `sniff`, `hijack-dns`, `ip_is_private → direct`, QUIC (UDP/443) к `seg-list` → reject, `seg-list` → VLESS, `final` → direct;
+- QUIC к selected-доменам отклоняется, чтобы браузер переходил на TCP (UDP через VLESS не проверялся);
+- full-tunnel клиент AmneziaWG (kill-switch) с TUN-режимом несовместим: на время работы SEG-клиента он отключается.
+
 SEG-клиенты:
 
 ```text
@@ -368,6 +376,8 @@ DNS strategy = ipv4_only
 
 Приложенческий DoH/DoT должен быть отключён или перехвачен TUN.
 
+Подтверждено прототипом: FakeIP (`198.18.0.0/15`) получают только домены `seg-list`, остальные домены резолвятся прямым DNS и получают настоящие адреса. Прямой DNS на Windows при `strict_route` — только DoH/DoT (раздел 8). Обратные (PTR) запросы Windows к адресу TUN-DNS остаются без ответа, поэтому `nslookup` показывает `UnKnown` и ждёт около 2 секунд; на работу это не влияет.
+
 ## 11. VPS2 — `seg-gateway`
 
 VPS2 использует:
@@ -379,7 +389,9 @@ nftables
 iproute2
 ```
 
-Пакет `sing-box` скачивается на ноутбук, проверяется по SHA-256 и копируется на VPS2. Конфигурации проверяются локально командой `sing-box check` до отправки.
+Пакет `sing-box` скачивается на ноутбук, проверяется по SHA-256 и копируется на VPS2. Конфигурации проверяются локально командой `sing-box check` до отправки. Серверный конфиг содержит `routing_mark`, который поддерживается только на Linux: Windows-бинарник `sing-box check` его отклоняет. Поэтому серверный конфиг проверяется Linux-бинарником (на VPS2 до замены рабочего конфига или в WSL), клиентский — локальным Windows-бинарником.
+
+Служба `sing-box` на VPS2 работает от отдельного пользователя `sing-box` с `CAP_NET_ADMIN` (нужна для `routing_mark`) и `CAP_NET_BIND_SERVICE`, `ProtectSystem=strict`. В прототипе процесс занимает около 55 МБ RSS при VPS2 с ~0,9 ГБ RAM без swap.
 
 Функции:
 
@@ -428,6 +440,20 @@ VPS2_BACKHAUL_IP
 
 Остальной доступ к backhaul network запрещён.
 
+### Порядок правил sing-box на VPS2
+
+Подтверждено прототипом:
+
+1. `sniff` (TLS SNI, QUIC);
+2. reject для private, loopback и link-local адресов (`ip_is_private`; сеть backhaul входит в private);
+3. `seg-list` (домен, sniffed-домен, CIDR) → selected outbound;
+4. `resolve` локальным резолвером VPS2 и повторный reject private: домен, указывающий на локальный адрес, не должен пройти;
+5. `final` → direct (политика `direct`) или reject (политика `block`).
+
+Selected outbound использует `domain_resolver` на DNS VPS1 с `detour` через selected outbound. DNS-правило отправляет домены `seg-list` на resolver VPS1, остальные — на локальный.
+
+Проверено: домен из VLESS-запроса, sniffed-домен при IP-подключении с SNI из `seg-list` и CIDR дают выход через VPS1, остальной трафик выходит с IP VPS2.
+
 ### Страховочный DIRECT
 
 - Direct-трафик не получает `SEG_MARK` и никогда не использует `awg-backhaul`.
@@ -449,9 +475,9 @@ VPS2_BACKHAUL_IP
 
 У selected outbound `domain_resolver` указывает только на resolver VPS1. При недоступности resolver VPS1 selected-запрос завершается ошибкой.
 
-## 13. Policy routing VPS2
+## 13. Маршрутизация selected-трафика VPS2
 
-Схема ниже подлежит подтверждению прототипом (roadmap, пункт 0): возможно, достаточно маршрута через `awg-backhaul` с высокой метрикой для сокетов, привязанных `bind_interface`, без отдельной таблицы и `ip rule`. Обязательны в любом случае: невозможность выхода selected-трафика через публичный интерфейс и правило nftables из раздела 14.
+Прототип (этап 0) показал, что отдельная таблица `seg` и `ip rule` по `SEG_MARK` не нужны. Сокет, привязанный `bind_interface = awg-backhaul`, выходит в туннель без маршрутов в таблицах и не использует main table. При падении интерфейса `connect` завершается ошибкой, а трафик вне `seg-list` не затрагивается. Маршрут через `awg-backhaul` с высокой метрикой также не нужен.
 
 Backhaul использует:
 
@@ -459,45 +485,27 @@ Backhaul использует:
 Table = off
 ```
 
-Создаётся отдельная таблица:
-
-```text
-table seg
-```
-
 Selected outbound получает:
 
 ```text
+bind_interface = awg-backhaul
 routing_mark = SEG_MARK
 ```
 
-`SEG_MARK` не совпадает с fwmark AmneziaWG, метками UFW и `awg-iptables`.
+`SEG_MARK` не совпадает с fwmark AmneziaWG, метками UFW и `awg-iptables`. В прототипе `SEG_MARK = 0x5e90`. Метка нужна только правилу fail-closed (раздел 14).
 
-Правило:
-
-```text
-fwmark SEG_MARK
-  → lookup table seg
-```
-
-Таблица:
-
-```text
-default dev awg-backhaul
-```
-
-Основная таблица VPS2 остаётся:
+Основная таблица VPS2 не изменяется:
 
 ```text
 main default
   → public interface VPS2
 ```
 
-Selected traffic не использует main table. Привязка `bind_interface` и таблица `seg` — два независимых уровня; последний рубеж — правило nftables из раздела 14.
+Selected traffic не использует main table. Привязка `bind_interface` и правило nftables с меткой — два независимых уровня: привязка направляет трафик в backhaul, правило из раздела 14 не выпускает его в публичный интерфейс.
 
-Ответный трафик из backhaul приходит с внешними адресами не со стороны публичного интерфейса, поэтому `rp_filter` на VPS2 не должен отбрасывать его (loose или отключённый для `awg-backhaul`).
+Ответный трафик из backhaul приходит с внешними адресами не со стороны публичного интерфейса, поэтому `rp_filter` на VPS2 не должен отбрасывать его (loose или отключённый для `awg-backhaul`). В прототипе `rp_filter` не менялся и ответы проходили; проверка в нужной конфигурации остаётся за автоматизацией.
 
-MTU `awg-backhaul` и MSS clamp задаются явно и подтверждаются проверкой больших передач.
+MTU `awg-backhaul` и MSS clamp задаются явно и подтверждаются проверкой больших передач (в прототипе не выполнялась).
 
 ## 14. Fail-closed VPS2
 
@@ -537,6 +545,14 @@ selected traffic → public interface VPS2
 
 Страховочный DIRECT (раздел 12) этому правилу не противоречит: он относится только к трафику вне `seg-list` и не помечается.
 
+Реализация в прототипе:
+
+- таблица `inet seg_failclosed`, цепочка `output` (hook output, приоритет `-100`): `meta mark SEG_MARK` и `oifname != "awg-backhaul"` → drop со счётчиком; в ту же цепочку входит блокировка исходящего tcp/25 не через backhaul;
+- таблица загружается из `/etc/seg/seg-failclosed.nft` юнитом `seg-failclosed.service` (oneshot, `Before=network-pre.target sing-box.service awg-quick@awg-backhaul.service`); `sing-box.service` имеет `Requires=` на fail-closed и только `Wants=` на `awg-quick@awg-backhaul`, жёсткой зависимости от backhaul нет;
+- после перезагрузки порядок запуска: fail-closed, backhaul, sing-box.
+
+Проверено: помеченный сокет без привязки к `awg-backhaul` дропается (счётчик растёт), привязанный проходит. При остановленном backhaul selected-запрос завершается ошибкой и никогда не выходит с IP VPS2, трафик вне `seg-list` работает через VPS2. После перезапуска backhaul selected-трафик восстанавливается без перезапуска `sing-box`.
+
 ## 15. VPS1 — `seg-exit`
 
 Первая реализация:
@@ -567,6 +583,8 @@ VPS1:
 - выпускает selected traffic в Internet.
 
 Входящие UDP/TCP сервисные порты VPS1 наружу не открываются: backhaul инициирует сам VPS1.
+
+Установка в прототипе: сначала `upgrade.sh`, затем пакеты AmneziaWG (PPA `amnezia/ppa`), `unbound` и nftables-юниты; `awg-quick@awg-backhaul` включён в автозапуск.
 
 ## 16. Backhaul
 
@@ -615,6 +633,10 @@ Backhaul использует собственные:
 - адреса;
 - порт.
 
+Параметры прототипа: сеть `10.77.0.0/30` (VPS2 `10.77.0.1`, VPS1 `10.77.0.2`), UDP-порт `42100` на VPS2. Параметры AmneziaWG (`Jc`, `Jmin`, `Jmax`, `S1`–`S4`, `H1`–`H4`, `RandomTrailers`) одинаковы на обеих сторонах. Сеть не пересекается с сетью клиентов AWG (`10.7.0.0/24`).
+
+Восстановление после перезапуска. VPS1 только инициирует соединение, а VPS2 не знает его Endpoint. После перезапуска `awg-backhaul` на VPS2 туннель мог оставаться нерабочим до ~3 минут, пока VPS1 сам не начинал новый handshake (`PersistentKeepalive = 25` этого не исправляет). Решение: на VPS1 служба `seg-exit-keepalive.service` (`ping -i 5 10.77.0.1`, `PartOf=awg-quick@awg-backhaul`). Восстановление сократилось до ~19 секунд. Пока есть трафик, AmneziaWG переустанавливает сессию примерно раз в 2 минуты.
+
 ## 17. DNS VPS1
 
 DNS resolver слушает только backhaul-IP VPS1.
@@ -630,6 +652,8 @@ DNS port
 Остальные подключения к resolver запрещены.
 
 DNS-запросы VPS1 выполняются через его зарубежный Internet egress.
+
+Реализация в прототипе: `unbound` слушает только `VPS1_BACKHAUL_IP` (`ip-freebind: yes`, чтобы служба стартовала до подъёма интерфейса), `access-control` разрешает только `VPS2_BACKHAUL_IP`, `do-ip6: no`. `systemd-resolved` на `127.0.0.53/54` не конфликтует. С `--no-install-recommends` нужен отдельный пакет `unbound-anchor`, а без `/var/lib/unbound/root.key` служба не запускается: файл создаётся командой `unbound-anchor -a` (код возврата 1 допустим) и передаётся пользователю `unbound`.
 
 ## 18. Безопасность VPS1
 
@@ -654,6 +678,17 @@ RETURN
   → established/related
 ```
 
+Реализация в прототипе (VPS1):
+
+- `net.ipv4.ip_forward = 1`;
+- таблица `inet seg_exit` (hook input и forward, приоритет `-10`): из `awg-backhaul` разрешён только DNS (udp/tcp 53) от `VPS2_BACKHAUL_IP` к `VPS1_BACKHAUL_IP`, остальное в INPUT дропается; в FORWARD разрешён только источник `VPS2_BACKHAUL_IP`, запрещены private, loopback, CGNAT, link-local, multicast, публичный IP VPS1, пересылка между backhaul-интерфейсами и IPv6;
+- таблица `ip seg_exit_nat`: masquerade `VPS2_BACKHAUL_IP` при выходе не через `awg-backhaul`;
+- юнит `seg-exit-fw.service` загружает таблицы до `awg-quick@awg-backhaul`.
+
+UFW на VPS1 активен. DROP в nftables окончателен, но ACCEPT в таблице `seg_exit` не отменяет решение UFW, поэтому в UFW нужны явные правила: DNS (tcp и udp 53) из `awg-backhaul` от `VPS2_BACKHAUL_IP` к `VPS1_BACKHAUL_IP` и `route allow in on awg-backhaul out on <внешний интерфейс> from VPS2_BACKHAUL_IP`. Правило UFW `22/tcp` из «Anywhere» остаётся, поэтому SSH через backhaul закрывает только таблица `seg_exit`.
+
+Проверено: DNS с VPS2 через VPS1 работает, запрос с другого source отклоняется, внешний IP через backhaul равен IP VPS1, metadata и SSH на backhaul-адрес VPS1 недоступны. Следствие запрета INPUT: ping VPS1 по backhaul не проходит, состояние проверяется по handshake и DNS.
+
 ## 19. REALITY
 
 Параметры:
@@ -676,6 +711,8 @@ x25519 keypair создаётся локальным `sing-box` (версия 1.
 
 - в локальном source of truth (`config/seg.env`);
 - на VPS2.
+
+Параметры прототипа: `server_name` и `dest` — `www.microsoft.com:443` (проверен с VPS2: TLS 1.3, ALPN h2; так же отвечают `www.apple.com`, `dl.google.com`, `www.cloudflare.com`), `flow = xtls-rprx-vision`, fingerprint клиента `chrome`, `short_id` — 8 байт hex. Ключи, UUID и `short_id` создаются локальным `sing-box generate reality-keypair`, `generate uuid`, `generate rand --hex 8`. Ошибки `REALITY: processed invalid connection` от посторонних сканеров в журнале VPS2 — штатный отказ неаутентифицированным клиентам.
 
 ## 20. Клиентские идентификаторы
 
@@ -719,7 +756,7 @@ Selected traffic использует IPv4, пока IPv6 egress VPS1 отдел
 - backhaul IPv6;
 - `AllowedIPs = ::/0` на VPS2;
 - адрес VPS2 peer на VPS1;
-- policy routing;
+- маршрутизация selected-трафика VPS2;
 - VPS1 routing;
 - fail-closed;
 - DNS strategy.
@@ -737,7 +774,7 @@ GATEWAY
 EXIT
 BACKHAUL
 HANDSHAKE AGE
-POLICY ROUTING
+SELECTED ROUTING
 DNS THROUGH BACKHAUL
 VPS1 EXTERNAL IP
 FAIL-CLOSED
@@ -747,14 +784,16 @@ SEG-LIST HASH
 SECURITY
 ```
 
-`-Check` не изменяет конфигурацию. `FAIL-CLOSED` проверяется пассивно: наличие правила nftables и `ip rule`, содержимое таблицы `seg`, счётчики. Активная проверка (остановка backhaul) выполняется вручную.
+`-Check` не изменяет конфигурацию. `FAIL-CLOSED` проверяется пассивно: наличие и счётчики правила в таблице `seg_failclosed` и состояние `seg-failclosed.service`. `SELECTED ROUTING` — привязка selected outbound к `awg-backhaul` в конфиге `sing-box` и активный `awg-backhaul`. Активная проверка (остановка backhaul) выполняется вручную.
+
+Возраст handshake в прототипе при работающем keepalive не превышал ~2 минут, поэтому предлагаемый порог предупреждения — более 180 секунд.
 
 ## 24. Порядок развёртывания
 
 ```text
 1. Upgrade/hardening.
 2. Fail-closed VPS2.
-3. Policy routing VPS2.
+3. Маршрутизация selected-трафика VPS2 (`bind_interface`, `rp_filter`, MTU).
 4. awg-backhaul VPS2.
 5. awg-backhaul VPS1.
 6. NAT/firewall/DNS VPS1.
@@ -775,7 +814,9 @@ SECURITY
 
 - VPS2 является единой точкой входа selected traffic.
 - VPS1 является единой точкой выхода selected traffic.
-- Неполный `seg-list` приводит к DIRECT-маршрутизации ресурса с клиента.
+- Неполный `seg-list` приводит к DIRECT-маршрутизации ресурса с клиента. Сервис использует много доменов: YouTube — `googlevideo.com`, `ytimg.com`, `ggpht.com`, `youtubei.googleapis.com`; ChatGPT — `openai.com`, `oaistatic.com`, `oaiusercontent.com`. Домен вне списка идёт DIRECT и может быть недоступен из РФ (на прототипе `youtube.ru` резолвится в адреса Google и не открывается).
+- Регион выходного IP VPS1 определяет поведение сервисов: на прототипе Cloudflare определил VPS1 как `loc=IN`.
+- VPS2 с ~0,9 ГБ RAM и без swap: `sing-box` занимает около 55 МБ, но обновления и сборка DKMS идут с малым запасом.
 - Устаревший клиентский профиль может не содержать новые правила; selected-ресурсы при этом обслуживает серверный `seg-list`.
 - Изменение доменов, CDN или IP сервисов требует обновления `seg-list`.
 - Прямые IP-подключения требуют CIDR-правил.
@@ -789,7 +830,7 @@ SECURITY
 - Блокировка VPS2 прекращает selected ingress.
 - Блокировка VPS1 прекращает selected egress.
 - DPI может обнаружить или заблокировать VLESS/REALITY или AmneziaWG.
-- Ошибка policy routing или fail-closed может привести к утечке через VPS2.
+- Ошибка настройки `bind_interface` или fail-closed может привести к утечке через VPS2.
 - Компрометация VPS2 раскрывает REALITY и backhaul credentials.
 - Компрометация VPS1 раскрывает backhaul credentials.
 - MTU/MSS требуют согласованной настройки backhaul.
@@ -812,3 +853,56 @@ seg\*.sh                bootstrap-seg.sh, secure-seg.sh
 ```
 
 Конфигурации SEG формируются из шаблонов `{{VAR}}`, зафиксированных по результатам прототипа (roadmap, пункт 0). Порядок и принципы реализации описаны в `roadmap.md`.
+
+## 28. Результаты прототипа (этап 0)
+
+Прототип выполнен на двух отдельных VPS (Ubuntu 24.04, 1 vCPU, ~1 ГБ RAM) и клиенте Windows. Рабочие VPN-серверы не затрагивались.
+
+### Подтверждено
+
+- backhaul AmneziaWG VPS1 → VPS2, инициация с VPS1, `Table = off`, восстановление после перезапуска (раздел 16);
+- NAT и DNS resolver VPS1, доступный только VPS2 через backhaul (разделы 17, 18);
+- VLESS + REALITY на VPS2, клиент `sing-box 1.14.4` с Windows (разделы 8, 19);
+- fail-closed: nftables по `SEG_MARK`, порядок запуска после перезагрузки (раздел 14);
+- `bind_interface` без отдельной таблицы маршрутизации (раздел 13);
+- sniffing на VPS2 и сопоставление домена и CIDR с `seg-list` (раздел 12);
+- клиентский TUN на Windows: FakeIP для `seg-list`, прямой DNS через DoH, остальной трафик DIRECT (разделы 8, 10);
+- блокировка tcp/25 вне backhaul;
+- установка `sing-box` из локально скачанного пакета: SHA-256 сверяется с релизом на ноутбуке и на VPS2 после копирования, загрузка с GitHub на VPS2 не используется.
+
+### Отклонения от первоначального SEG.md
+
+1. Таблица `seg` и `ip rule` не нужны: достаточно `bind_interface` (раздел 13).
+2. Серверный конфиг проверяется Linux-бинарником `sing-box`, не Windows (раздел 11).
+3. VPS1 нуждается в keepalive-пинге в backhaul (раздел 16).
+4. UFW на VPS1 требует явных правил к таблице nftables (раздел 18).
+5. Прямой DNS клиента на Windows — только DoH/DoT из-за `strict_route` (разделы 8, 10).
+6. `unbound` на VPS1 требует `unbound-anchor` и `root.key` (раздел 17).
+7. ICMP-ping VPS1 через backhaul не проходит; состояние проверяется по handshake и DNS (раздел 18).
+
+### Команды проверки
+
+Основа для `-Check` и тестов. Значения IP и порты берутся из `seg.env`.
+
+```text
+VPS2: awg show awg-backhaul latest-handshakes     возраст handshake = date +%s минус значение
+VPS2: dig +short +time=5 +tries=1 @VPS1_BACKHAUL_IP example.com
+VPS2: curl -s -m 10 --interface awg-backhaul https://api.ipify.org     = IP VPS1
+VPS2: nft list chain inet seg_failclosed output     правило и счётчики
+VPS2: systemctl is-active seg-failclosed awg-quick@awg-backhaul sing-box
+VPS1: systemctl is-active seg-exit-fw awg-quick@awg-backhaul seg-exit-keepalive unbound
+клиент: sing-box check -c <профиль>
+клиент: curl через профиль к хосту из seg-list = IP VPS1, к хосту вне списка = ожидаемый IP
+```
+
+### Не проверено
+
+- MTU, MSS и большие передачи через backhaul;
+- `rp_filter` на VPS2;
+- блокировка private, loopback и metadata на VPS2 отдельным тестом;
+- счётчик `UNMATCHED_DIRECT`;
+- поведение selected-трафика при недоступном DNS VPS1;
+- security hardening (`secure-seg.sh`) и UFW на VPS2;
+- IPv6;
+- UDP/XUDP через VLESS и поведение при ECH;
+- клиентский профиль для устаревшего `seg-list`.

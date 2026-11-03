@@ -65,7 +65,7 @@
 - `sing-box` на VPS2 с VLESS + REALITY;
 - `bind_interface = awg-backhaul` и `routing_mark = SEG_MARK`: поведение при остановленном backhaul (fail-closed);
 - правило nftables «mark и `oifname != awg-backhaul` → DROP»;
-- нужна ли отдельная таблица маршрутизации `seg` и `ip rule`, либо достаточно маршрута через `awg-backhaul` с высокой метрикой для привязанных сокетов (если достаточно, пункт 15 упрощается);
+- отдельная таблица маршрутизации `seg` и `ip rule` не нужны, достаточно `bind_interface` для привязанных сокетов (результат: `SEG.md`, раздел 13);
 - sniffing на VPS2 и сопоставление домена с `seg-list` в `sing-box 1.14.4`;
 - клиентский профиль `sing-box 1.14.4` в режиме TUN на Windows: FakeIP, DNS для selected-доменов через VPS1;
 - страховочный DIRECT, блокировку loopback/private/metadata, tcp/25;
@@ -81,6 +81,8 @@
 Часть тестов этапа 3 (пп. 32, 33, 36, 38, 39) выполняется на прототипе и повторяется после автоматизации в сокращённом виде.
 
 Прототип выполняется на отдельных VPS и не затрагивает рабочие VPN-серверы.
+
+Результаты прототипа, отклонения от первоначального `SEG.md` и список непроверенного зафиксированы в `SEG.md`, раздел 28.
 
 ## Порядок выполнения
 
@@ -649,33 +651,14 @@ Fail-closed:
 
 Обновить README: fail-closed и порядок после `ufw reload`.
 
-### Пункт 15. Реализовать policy routing VPS2
+### Пункт 15. Реализовать маршрутизацию selected-трафика VPS2
 
-Конкретная схема уточняется по результатам пункта 0: либо таблица `seg` с `ip rule` по `SEG_MARK`, как описано ниже, либо маршрут через `awg-backhaul` с высокой метрикой для привязанных сокетов (`bind_interface`) без отдельной таблицы. При любом варианте сохраняются требования fail-closed и правило nftables из пункта 14.
+По результатам прототипа (`SEG.md`, раздел 13) отдельная таблица `seg` и `ip rule` не используются: selected outbound привязывается к интерфейсу `bind_interface = awg-backhaul`, а метка `SEG_MARK` служит правилу fail-closed (пункт 14). Сохраняются требования fail-closed и правило nftables из пункта 14.
 
 Backhaul работает с:
 
 ```text
 Table = off
-```
-
-Создать отдельную routing table:
-
-```text
-table seg
-```
-
-Правило:
-
-```text
-fwmark SEG_MARK
-  → lookup table seg
-```
-
-Таблица:
-
-```text
-default dev awg-backhaul
 ```
 
 Основная таблица VPS2 не изменяется:
@@ -685,7 +668,7 @@ main default
   → public interface VPS2
 ```
 
-Служебный DNS-трафик к `VPS1_BACKHAUL_IP` также направлять через `awg-backhaul`.
+Служебный DNS-трафик к `VPS1_BACKHAUL_IP` идёт через selected outbound (`domain_resolver` на resolver VPS1 с `detour` через selected outbound).
 
 Дополнительно:
 
@@ -778,7 +761,7 @@ FORWARD разрешить только в Internet.
 - handshake;
 - возраст handshake;
 - backhaul addresses;
-- policy routing;
+- привязка selected outbound к `awg-backhaul`;
 - DNS VPS1 через backhaul;
 - Internet egress;
 - внешний IP через backhaul = VPS1.
@@ -1023,7 +1006,7 @@ SECURITY=OK
 
 Реализация: проверки backhaul (handshake, DNS, внешний IP через `awg-backhaul`) — тот же набор команд, что используется в тестах и в прототипе (пункт 0); отдельной логики для `-Check` не создаётся.
 
-`FAIL_CLOSED` проверяется пассивно: правило nftables, маршрутизация backhaul (`ip rule` и таблица `seg`, если используются), счётчики. Активная проверка (остановка backhaul) выполняется вручную (пункт 38).
+`FAIL_CLOSED` проверяется пассивно: правило и счётчики в таблице nftables `seg_failclosed`, состояние `seg-failclosed.service`, привязка selected outbound к `awg-backhaul`. Активная проверка (остановка backhaul) выполняется вручную (пункт 38).
 
 `UNMATCHED_DIRECT` — счётчик страховочного DIRECT. Ненулевое значение означает, что клиент направляет на VPS2 трафик не по `seg-list`; это предупреждение, а не ошибка.
 
@@ -1040,7 +1023,7 @@ SECURITY=OK
 4. Выполнить hardening.
 5. Подготовить candidate-конфигурации.
 6. Установить fail-closed на VPS2.
-7. Настроить policy routing VPS2.
+7. Настроить маршрутизацию selected-трафика VPS2.
 8. Настроить awg-backhaul VPS2.
 9. Настроить awg-backhaul/NAT/firewall/DNS VPS1.
 10. Проверить handshake.
@@ -1058,7 +1041,7 @@ SECURITY=OK
 
 - backhaul configs;
 - nftables rules;
-- policy-routing rules;
+- правила nftables fail-closed;
 - sing-box config;
 - systemd units.
 
@@ -1079,7 +1062,7 @@ SECURITY=OK
 
 Пункты 32–41 выполняются сначала на прототипе (пункт 0), затем после автоматизации в сокращённом виде. Перекрывающиеся проверки объединяются в один прогон:
 
-- пп. 33 и 38 (policy routing и fail-closed);
+- пп. 33 и 38 (маршрутизация selected-трафика и fail-closed);
 - пп. 35, 36 и 39 (клиентская маршрутизация, передача домена, DNS).
 
 Проверки backhaul выполняются тем же набором команд, что и `-Check` (пункт 26).
@@ -1156,14 +1139,14 @@ VPS1 = seg-exit + amnezia
 - DNS resolver VPS1;
 - reboot обоих серверов.
 
-### Пункт 33. Проверка policy routing
+### Пункт 33. Проверка маршрутизации selected-трафика
 
 Проверить:
 
 ```text
-SEG_MARK
-  → table seg
-  → awg-backhaul
+selected outbound
+  → bind_interface = awg-backhaul
+  → внешний IP = IP VPS1
 ```
 
 Проверить:
@@ -1173,7 +1156,7 @@ main default
   → public interface VPS2
 ```
 
-Остановка `awg-backhaul` не должна переводить `SEG_MARK`-трафик в main table.
+Остановка `awg-backhaul` не должна выпускать `SEG_MARK`-трафик через публичный интерфейс: помеченный сокет без привязки к `awg-backhaul` дропается правилом fail-closed.
 
 Проверить также:
 
@@ -1312,7 +1295,7 @@ backhaul DOWN
 - backhaul down;
 - sing-box down;
 - DNS VPS1 down;
-- policy-routing rule отсутствует;
+- правила fail-closed отсутствуют (таблица `seg_failclosed` не загружена);
 - reboot VPS1;
 - reboot VPS2;
 - изменение IP VPS1;
@@ -1328,7 +1311,7 @@ backhaul DOWN
 
 - firewall;
 - nftables fail-closed;
-- policy routing;
+- маршрутизация selected-трафика;
 - SSH hardening;
 - права файлов;
 - backup/restore по режимам (`server.env` и `seg.env` независимо);
@@ -1354,7 +1337,7 @@ backhaul DOWN
 | 6 `seg.env`, backup | локальные данные, `generate-server-env.ps1 -Mode` |
 | 7 `seg-list.json` | структура, порядок изменения |
 | 8–10, 21 клиент, DNS, версия списка | клиент, профили, DNS-модель |
-| 11–14 VPS2, страховочный DIRECT, policy routing, fail-closed | роль `seg-gateway`, `SEG_UNMATCHED_POLICY`, `ufw reload` |
+| 11–14 VPS2, страховочный DIRECT, маршрутизация selected-трафика, fail-closed | роль `seg-gateway`, `SEG_UNMATCHED_POLICY`, `ufw reload` |
 | 15–18 VPS1, backhaul, безопасность | роль `seg-exit`, backhaul |
 | 19–20 REALITY, UUID | ключи, клиенты, отзыв |
 | 22 IPv6 | ограничения и включение |
